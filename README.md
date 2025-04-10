@@ -21,7 +21,7 @@
 
 ### 文本补全接口
 
-**Endpoint:** `/v1/bert/completions`
+**Endpoint:** `/v1/bert/mask_fill`
 
 **请求方法:** POST
 
@@ -64,7 +64,7 @@
 ```python
 import requests
 
-url = "http://localhost:8000/v1/bert/completions"  # 固定的API路径
+url = "http://localhost:8000/v1/bert/mask_fill"  # 固定的API路径
 data = {
     "model": "bert-base-chinese",
     "texts": ["巴黎是[MASK]国的首都", "北京是[MASK]国的首都"]
