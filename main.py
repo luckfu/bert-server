@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 from transformers import BertTokenizer, BertForMaskedLM, BertForSequenceClassification, BertForTokenClassification, BertForQuestionAnswering
 import torch
 from datetime import datetime
@@ -90,12 +90,22 @@ class ClassificationRequest(BaseRequest):
 
 class NERRequest(BaseRequest):
     texts: Union[str, List[str]]
+    labels: Union[Dict[int, str], List[str]]
 
     @field_validator('texts')
     @classmethod
     def validate_texts(cls, v):
         if isinstance(v, str):
             return [v]
+        return v
+        
+    @field_validator('labels')
+    @classmethod
+    def validate_labels(cls, v):
+        if v is None:
+            raise ValueError("labels参数是必填项，请提供实体标签映射。可以是字典格式{id: label}或列表格式[label1, label2]，例如：\n{\"1\": \"PER\", \"2\": \"ORG\"}\n或\n[\"PER\", \"ORG\"]")
+        if isinstance(v, list):
+            return {i: label for i, label in enumerate(v)}
         return v
 
 class QARequest(BaseRequest):
@@ -255,8 +265,8 @@ async def create_ner(request: NERRequest):
             predictions = torch.softmax(outputs.logits, dim=-1)
             pred_labels = torch.argmax(predictions, dim=-1)
             
-            # 定义NER标签映射
-            ner_labels = {
+            # 使用传入的标签映射或默认值
+            ner_labels = request.labels if request.labels else {
                 1: "PER",  # 人名
                 2: "ORG",  # 组织
                 3: "LOC",  # 地点
@@ -300,13 +310,55 @@ async def create_ner(request: NERRequest):
                             current_entity = {
                                 "text": token,
                                 "label": label,
-                                "confidence": confidence
+                                "confidence": confidence,
+                                "last_pos": j,
+                                "token_count": 1
                             }
                         else:
                             # 如果标签相同，则合并实体
                             if current_entity["label"] == label:
-                                current_entity["text"] += token
-                                current_entity["confidence"] = max(current_entity["confidence"], confidence)
+                                # 检查是否是连续token
+                                if j == current_entity['last_pos'] + 1:
+                                    # 合并连续的中文字符
+                                    if token.startswith("##"):
+                                        current_entity["text"] += token[2:]
+                                    else:
+                                        # 检查是否是中文连续字符
+                                        if len(token) == 1 and '\u4e00' <= token <= '\u9fff':
+                                            current_entity["text"] += token
+                                        else:
+                                            # 非中文连续字符则保存当前实体并开始新实体
+                                            start_pos = text.find(current_entity["text"])
+                                            if start_pos != -1:
+                                                current_entity["start"] = start_pos
+                                                current_entity["end"] = start_pos + len(current_entity["text"])
+                                                entities.append(current_entity)
+                                            current_entity = {
+                                                "text": token,
+                                                "label": label,
+                                                "confidence": confidence,
+                                                "last_pos": j,
+                                                "token_count": 1
+                                            }
+                                            continue
+                                    # 计算平均置信度
+                                    current_entity["confidence"] = (current_entity["confidence"] * current_entity.get('token_count', 1) + confidence) / (current_entity.get('token_count', 1) + 1)
+                                    current_entity['token_count'] = current_entity.get('token_count', 1) + 1
+                                    current_entity['last_pos'] = j
+                                else:
+                                    # 不连续则保存当前实体并开始新实体
+                                    start_pos = text.find(current_entity["text"])
+                                    if start_pos != -1:
+                                        current_entity["start"] = start_pos
+                                        current_entity["end"] = start_pos + len(current_entity["text"])
+                                        entities.append(current_entity)
+                                    current_entity = {
+                                        "text": token,
+                                        "label": label,
+                                        "confidence": confidence,
+                                        "last_pos": j,
+                                        "token_count": 1
+                                    }
                             else:
                                 # 如果标签不同，保存当前实体并开始新实体
                                 start_pos = text.find(current_entity["text"])
@@ -315,9 +367,11 @@ async def create_ner(request: NERRequest):
                                     current_entity["end"] = start_pos + len(current_entity["text"])
                                     entities.append(current_entity)
                                 current_entity = {
-                                    "text": token,
+                                    "text": token if not token.startswith("##") else token[2:],
                                     "label": label,
-                                    "confidence": confidence
+                                    "confidence": confidence,
+                                    "last_pos": j,
+                                    "token_count": 1
                                 }
                 
                 if current_entity:
@@ -381,7 +435,9 @@ async def create_qa(request: QARequest):
                 # 确保开始位置在结束位置之前
                 if start_idx <= end_idx:
                     answer_tokens = inputs["input_ids"][0][start_idx:end_idx+1]
-                    answer_text = tokenizer.decode(answer_tokens)
+                    answer_text = tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+                    # 移除可能的特殊标记
+                    answer_text = answer_text.replace("[CLS]", "").replace("[SEP]", "").strip()
                 else:
                     answer_text = ""
                 
