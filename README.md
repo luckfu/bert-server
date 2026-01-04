@@ -1,18 +1,33 @@
-# BART 推理服务
+# BERT 推理服务
 
-这是一个基于FastAPI的BART模型推理服务，模拟了OpenAI API的接口格式。
+这是一个基于FastAPI的BERT模型推理服务，模拟了OpenAI API的接口格式。
 
 ## 启动服务
 
 服务启动时需要指定以下命令行参数：
 
-- `--service-name`: 服务使用的模型名称，默认为'bart'，请求时需要在model字段中使用相同的值
+- `--service-name`: 服务使用的模型名称，默认为'bert'，请求时需要在model字段中使用相同的值
 - `--model-path`: 模型目录路径（必需参数）
+- `--task-type`: 任务类型（必需参数），可选值：
+  - `mask_fill`: 掩码填充任务
+  - `classification`: 文本分类任务
+  - `ner`: 命名实体识别任务
+  - `qa`: 问答任务
 - `--host`: 服务主机地址，默认为'0.0.0.0'
 - `--port`: 服务端口号，默认为8000
 
 ```bash
- python3 bert_server.pyc --model-path ./bert-base-chinese --service-name bert-base-chinese
+# 启动掩码填充服务
+python3 main.py --model-path ./bert-base-chinese --task-type mask_fill
+
+# 启动文本分类服务
+python3 main.py --model-path ./bert-base-chinese --task-type classification
+
+# 启动命名实体识别服务
+python3 main.py --model-path ./bert-base-chinese --task-type ner
+
+# 启动问答服务
+python3 main.py --model-path ./bert-base-chinese --task-type qa
 ```
 
 服务将在 http://localhost:8000 启动
@@ -29,7 +44,7 @@
 
 ```json
 {
-    "model": "bert-base-chinese",  // BART模型名称
+    "model": "bert",  // BERT模型名称
     "texts": ["需要补全的文本1", "需要补全的文本2"],  // 输入文本列表
     "max_tokens": 50,  // 可选，最大生成长度
     "temperature": 1.0  // 可选，生成多样性参数
@@ -43,7 +58,7 @@
     "id": "cmpl-20231205123456",
     "object": "text_completion",
     "created": 1701765432,
-    "model": "facebook/bart-base",
+    "model": "bert-base-chinese",
     "choices": [
         {
             "text": "生成的文本1",
@@ -66,7 +81,7 @@ import requests
 
 url = "http://localhost:8000/v1/bert/mask_fill"  # 固定的API路径
 data = {
-    "model": "bert-base-chinese",
+    "model": "bert",
     "texts": ["巴黎是[MASK]国的首都", "北京是[MASK]国的首都"]
 }
 
@@ -79,10 +94,10 @@ print(response.json())
 你也可以使用curl命令行工具来测试服务：
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/bart/completions"  \
+curl -X POST "http://127.0.0.1:8000/v1/bert/mask_fill"  \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "bert-base-chinese",
+    "model": "bert",
     "texts": ["北京是[MASK]国的首都", "巴黎是[MASK]国的首都"],
     "max_tokens": 50,
     "temperature": 1.0
@@ -119,10 +134,10 @@ curl -X POST "http://127.0.0.1:8000/v1/bart/completions"  \
 
 **请求参数:**
 ```bash
-curl -X POST http://localhost:8000/v1/bart/classification \
+curl -X POST http://localhost:8000/v1/bert/classification \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "bert-base-chinese",
+    "model": "bert",
     "texts": ["这是一个很棒的电影", "这部电影太差劲了"],
     "labels": ["正面", "负面"],
     "max_tokens": 50,
@@ -136,10 +151,10 @@ curl -X POST http://localhost:8000/v1/bart/classification \
 **请求方法:** POST
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/bart/ner" \
+curl -X POST "http://127.0.0.1:8000/v1/bert/ner" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "bert-base-chinese",
+    "model": "bert",
     "texts": ["my name is roc", "比尔盖茨是微软的创始人"],
     "labels": ["PER", "ORG", "LOC"],
     "max_tokens": 50,
@@ -151,10 +166,10 @@ curl -X POST "http://127.0.0.1:8000/v1/bart/ner" \
 
 **请求方法:** POST
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/bart/qa" \
+curl -X POST "http://127.0.0.1:8000/v1/bert/qa" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "bert-base-chinese",
+    "model": "bert",
     "questions": ["阿里巴巴的创始人是谁?"],
     "contexts": ["马云是阿里巴巴的创始人"],
     "max_tokens": 50,
