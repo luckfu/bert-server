@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Literal
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -34,6 +34,61 @@ class ServiceConfig:
     task_type: TaskType
     max_concurrency: int
     device: torch.device
+    autocast_device_type: Optional[Literal["cuda", "cpu"]]
+    autocast_dtype: Optional[torch.dtype]
+    tf32: bool
+    torch_compile: bool
+    torch_compile_mode: str
+    cpu_threads: Optional[int]
+    cpu_interop_threads: Optional[int]
+
+
+def _parse_bool(raw: Optional[str], default: bool = False) -> bool:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_optional_int(raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"无效整数: {raw}")
+
+
+def _resolve_autocast(device: torch.device, dtype_raw: str) -> Tuple[Optional[Literal["cuda", "cpu"]], Optional[torch.dtype]]:
+    dtype_raw = (dtype_raw or "auto").strip().lower()
+    if dtype_raw in {"fp32", "float32", "none", "off"}:
+        return None, None
+
+    if device.type == "cuda":
+        if dtype_raw in {"auto"}:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            return "cuda", dtype
+        if dtype_raw in {"fp16", "float16"}:
+            return "cuda", torch.float16
+        if dtype_raw in {"bf16", "bfloat16"}:
+            return "cuda", torch.bfloat16
+        raise RuntimeError(f"DTYPE 无效: {dtype_raw}")
+
+    if device.type == "cpu":
+        if dtype_raw in {"auto"}:
+            return None, None
+        if dtype_raw in {"bf16", "bfloat16"}:
+            return "cpu", torch.bfloat16
+        raise RuntimeError("CPU 仅支持 DTYPE=fp32/auto/bf16")
+
+    return None, None
 
 
 def _load_config_from_env() -> ServiceConfig:
@@ -42,6 +97,12 @@ def _load_config_from_env() -> ServiceConfig:
     task_type_raw = os.getenv("TASK_TYPE")
     max_concurrency_raw = os.getenv("MAX_CONCURRENCY", "5")
     device_raw = os.getenv("DEVICE")
+    dtype_raw = os.getenv("DTYPE", "auto")
+    tf32_raw = os.getenv("TF32", "1")
+    torch_compile_raw = os.getenv("TORCH_COMPILE", "0")
+    torch_compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
+    cpu_threads_raw = os.getenv("CPU_THREADS")
+    cpu_interop_threads_raw = os.getenv("CPU_INTEROP_THREADS")
 
     if not model_path:
         raise RuntimeError("MODEL_PATH 未设置")
@@ -65,12 +126,25 @@ def _load_config_from_env() -> ServiceConfig:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    autocast_device_type, autocast_dtype = _resolve_autocast(device, dtype_raw)
+    tf32 = _parse_bool(tf32_raw, default=True)
+    torch_compile = _parse_bool(torch_compile_raw, default=False)
+    cpu_threads = _parse_optional_int(cpu_threads_raw)
+    cpu_interop_threads = _parse_optional_int(cpu_interop_threads_raw)
+
     return ServiceConfig(
         service_name=service_name,
         model_path=model_path,
         task_type=task_type,
         max_concurrency=max_concurrency,
         device=device,
+        autocast_device_type=autocast_device_type,
+        autocast_dtype=autocast_dtype,
+        tf32=tf32,
+        torch_compile=torch_compile,
+        torch_compile_mode=torch_compile_mode,
+        cpu_threads=cpu_threads,
+        cpu_interop_threads=cpu_interop_threads,
     )
 
 
@@ -99,10 +173,29 @@ def _startup() -> None:
     if not os.path.exists(config.model_path):
         raise RuntimeError(f"模型路径不存在: {config.model_path}")
 
+    if config.cpu_threads is not None:
+        torch.set_num_threads(config.cpu_threads)
+    if config.cpu_interop_threads is not None:
+        torch.set_num_interop_threads(config.cpu_interop_threads)
+
+    if config.device.type == "cuda" and config.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
     tokenizer = _load_tokenizer(config.model_path)
     model = _load_model(config.task_type, config.model_path)
     model.to(config.device)
     model.eval()
+
+    if config.torch_compile:
+        try:
+            model = torch.compile(model, mode=config.torch_compile_mode)
+        except Exception:
+            pass
 
     app.state.config = config
     app.state.tokenizer = tokenizer
@@ -225,6 +318,9 @@ async def _forward(**inputs):
 
     def _run():
         with torch.inference_mode():
+            if config.autocast_device_type and config.autocast_dtype is not None:
+                with torch.autocast(config.autocast_device_type, dtype=config.autocast_dtype):
+                    return model(**inputs)
             return model(**inputs)
 
     outputs = await run_in_threadpool(_run)
@@ -522,6 +618,9 @@ def health():
         "service_name": config.service_name,
         "task_type": config.task_type.value,
         "device": str(config.device),
+        "autocast_dtype": str(config.autocast_dtype) if config.autocast_dtype is not None else None,
+        "tf32": config.tf32 if config.device.type == "cuda" else None,
+        "torch_compile": config.torch_compile,
     }
 
 
@@ -543,6 +642,12 @@ if __name__ == "__main__":
     parser.add_argument("--task-type", type=str, required=True, choices=[t.value for t in TaskType], help="任务类型")
     parser.add_argument("--max-concurrency", type=int, default=5, help="最大并发请求数")
     parser.add_argument("--device", type=str, default=None, help="推理设备，如 cpu/cuda/cuda:0")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"], help="自动混精推理 dtype")
+    parser.add_argument("--tf32", type=int, default=1, choices=[0, 1], help="CUDA TF32 开关(1/0)")
+    parser.add_argument("--torch-compile", type=int, default=0, choices=[0, 1], help="torch.compile 开关(1/0)")
+    parser.add_argument("--torch-compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
+    parser.add_argument("--cpu-threads", type=int, default=None, help="CPU intra-op 线程数")
+    parser.add_argument("--cpu-interop-threads", type=int, default=None, help="CPU inter-op 线程数")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务主机地址")
     parser.add_argument("--port", type=int, default=8000, help="服务端口号")
 
@@ -551,6 +656,14 @@ if __name__ == "__main__":
     os.environ["MODEL_PATH"] = args.model_path
     os.environ["TASK_TYPE"] = args.task_type
     os.environ["MAX_CONCURRENCY"] = str(args.max_concurrency)
+    os.environ["DTYPE"] = args.dtype
+    os.environ["TF32"] = str(args.tf32)
+    os.environ["TORCH_COMPILE"] = str(args.torch_compile)
+    os.environ["TORCH_COMPILE_MODE"] = args.torch_compile_mode
+    if args.cpu_threads is not None:
+        os.environ["CPU_THREADS"] = str(args.cpu_threads)
+    if args.cpu_interop_threads is not None:
+        os.environ["CPU_INTEROP_THREADS"] = str(args.cpu_interop_threads)
     if args.device:
         os.environ["DEVICE"] = args.device
 
